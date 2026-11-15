@@ -84,6 +84,21 @@ class Proc:
 
 
 @dataclass
+class CpuCores:
+    cores: int = 0                # physical cores the kernel sees (6 stock, 8 unlocked)
+    threads: int = 0
+    tctl_c: float | None = None   # k10temp Tctl
+    unlock_tool: str = ""         # path of bc250-8core-unlock, "" if not installed
+    boot_unit: bool = False       # unit file present
+    boot_enabled: bool = False    # unit enabled (re-applies mask after cold boots)
+    no_cstate_cpus: list[int] = field(default_factory=list)
+
+    @property
+    def unlocked(self) -> bool:
+        return self.cores >= 8
+
+
+@dataclass
 class Ttm:
     pages_limit: int = 0          # in 4 KiB pages, 0 = unknown
     page_pool_size: int = 0
@@ -121,6 +136,7 @@ class Snapshot:
     procs: list[Proc] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     ttm: Ttm = field(default_factory=Ttm)
+    cpu: CpuCores = field(default_factory=CpuCores)
     llm_procs: list[Proc] = field(default_factory=list)
     ollama: list[OllamaModel] | None = None    # None = Ollama API not reachable
     swap_in_rate: float = 0.0     # pages/s
@@ -318,6 +334,48 @@ def read_ttm() -> Ttm:
     return t
 
 
+UNLOCK_UNIT = "bc250-8core-unlock.service"
+
+
+def find_unlock_tool() -> str:
+    """Locate GabriWar's bc250-8core-unlock script (not bundled - see README)."""
+    import shutil
+    cands = [os.environ.get("BC250_UNLOCK_SCRIPT", ""), "/usr/local/bin/bc250-8core-unlock",
+             shutil.which("bc250-8core-unlock") or "", shutil.which("bc250-8core-unlock.sh") or "",
+             os.path.expanduser("~/bc250-core-cu-unlock/bc250-8core-unlock.sh")]
+    for c in cands:
+        if c and os.access(_p(c), os.X_OK):
+            return os.path.abspath(c)
+    return ""
+
+
+def read_cpu() -> CpuCores:
+    c = CpuCores()
+    ids, threads = set(), 0
+    phys = "0"
+    for line in _read("/proc/cpuinfo").splitlines():
+        if line.startswith("processor"):
+            threads += 1
+        elif line.startswith("physical id"):
+            phys = line.split(":")[1].strip()
+        elif line.startswith("core id"):
+            ids.add((phys, line.split(":")[1].strip()))
+    c.cores, c.threads = len(ids), threads
+    for hw in glob.glob(_p("/sys/class/hwmon/hwmon*")):
+        if _read(hw[len(ROOT):] + "/name") == "k10temp":
+            c.tctl_c = _read_int(hw[len(ROOT):] + "/temp1_input") / 1000
+            break
+    c.unlock_tool = find_unlock_tool()
+    c.boot_unit = os.path.exists(_p("/etc/systemd/system/" + UNLOCK_UNIT))
+    c.boot_enabled = os.path.exists(_p("/etc/systemd/system/multi-user.target.wants/" + UNLOCK_UNIT))
+    # After the unlock, the stock 6-core ACPI tables give CPUs 12-15 no C-states.
+    if c.unlocked:
+        for n in range(12, threads):
+            if not glob.glob(_p(f"/sys/devices/system/cpu/cpu{n}/cpuidle/state*")):
+                c.no_cstate_cpus.append(n)
+    return c
+
+
 def read_vmstat() -> dict[str, int]:
     out = {}
     for line in _read("/proc/vmstat").splitlines():
@@ -420,7 +478,7 @@ def build_warnings(s: Snapshot) -> list[str]:
     for m in s.ollama or []:
         if m.size and m.size_vram < m.size * 0.98:
             w.append(f"Ollama model {m.name} is only {100 * m.size_vram / m.size:.0f}% on the GPU "
-                     "- the rest runs on the 6 CPU cores and will be much slower.")
+                     f"- the rest runs on the {s.cpu.cores or 6} CPU cores and will be much slower.")
     for p in s.llm_procs:
         adj = read_oom_adj(p.pid)
         if adj is not None and adj > 0:
@@ -433,6 +491,14 @@ def build_warnings(s: Snapshot) -> list[str]:
         w.append("GTT (GPU borrowed system RAM) above 90% - games may stutter or crash.")
     if g.vram_total > 600 * MiB and g.vram_used / g.vram_total > 0.95:
         w.append("Fixed VRAM carve-out is full; the GPU is spilling into GTT.")
+    c = s.cpu
+    if c.no_cstate_cpus:
+        w.append(f"CPUs {', '.join(map(str, c.no_cstate_cpus))} have no idle C-states: the stock "
+                 "6-core ACPI tables don't cover the unlocked cores, so they never sleep (more heat "
+                 "and power). Fix: 8-core SSDT tables (bc250-acpi-fix.sh in bc250-core-cu-unlock).")
+    if c.unlocked and c.tctl_c and c.tctl_c > 85:
+        w.append(f"CPU Tctl {c.tctl_c:.0f} C with 8 cores unlocked - the extra cores share the "
+                 "SoC's power/thermal budget. Check cooling and re-validate any undervolt.")
     if g.temp_c and g.temp_c > 90:
         w.append(f"GPU temperature {g.temp_c:.0f} C - check the BC-250 cooling/fan.")
     return w
@@ -455,6 +521,7 @@ def snapshot(procs: bool = True, rates: "RateTracker | None" = None) -> Snapshot
     s.zram = read_zram()
     s.cmdline = _read("/proc/cmdline")
     s.ttm = read_ttm()
+    s.cpu = read_cpu()
     if procs:
         allp = read_procs(limit=10_000)
         s.procs = allp[:10]

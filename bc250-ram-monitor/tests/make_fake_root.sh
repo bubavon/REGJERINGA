@@ -40,3 +40,15 @@ echo 200 > $R/proc/777/oom_score_adj
 printf 'drm-driver:\tamdgpu\ndrm-client-id:\t9\ndrm-memory-vram:\t300000 KiB\ndrm-memory-gtt:\t9000000 KiB\n' > $R/proc/777/fdinfo/20
 printf 'pswpin 10\npswpout 20\npgmajfault 30\n' > $R/proc/vmstat
 echo '{"models":[{"name":"qwen3:14b","size":9900000000,"size_vram":9000000000,"context_length":32768}]}' > $R/ollama_ps.json
+# --- CPU: stock 6 cores / 12 threads, k10temp. Pass UNLOCKED=1 for an 8-core board
+# whose new CPUs (12-15) have no C-states yet.
+N=6; [ -n "$UNLOCKED" ] && N=8
+: > $R/proc/cpuinfo
+t=0; for th in 0 1; do for c in $(seq 0 $((N-1))); do
+  printf 'processor\t: %d\nphysical id\t: 0\ncore id\t\t: %d\n\n' $t $c >> $R/proc/cpuinfo
+  if [ $t -lt 12 ]; then mkdir -p $R/sys/devices/system/cpu/cpu$t/cpuidle/state0; fi
+  t=$((t+1)); done; done
+mkdir -p $R/sys/class/hwmon/hwmon1; echo k10temp > $R/sys/class/hwmon/hwmon1/name
+echo 68500 > $R/sys/class/hwmon/hwmon1/temp1_input
+mkdir -p $R/usr/local/bin; printf '#!/bin/sh\necho fake\n' > $R/usr/local/bin/bc250-8core-unlock
+chmod +x $R/usr/local/bin/bc250-8core-unlock

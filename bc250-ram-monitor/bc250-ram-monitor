@@ -80,6 +80,7 @@ def report(s: core.Snapshot, color: bool = True) -> str:
     L.append(f"UMA mode : {s.uma_mode}")
     L.append(f"Pool     : {fmt(s.pool_total)} = system {fmt(s.mem_total)}"
              f" + VRAM carve-out {fmt(s.carveout)} + firmware {fmt(s.firmware_reserved)}")
+    L += cpu_lines(s)
     L.append("")
     if s.mem_total:
         L.append(f"{B}System RAM{R}  {bar(s.used / s.mem_total)}  "
@@ -157,11 +158,55 @@ def run_log(path: str):
             print()
 
 
+# ------------------------------------------------------------ 8-core unlock
+UNLOCK_REPO = "https://github.com/GabriWar/bc250-core-cu-unlock"
+GOVERNORS = "cyan-skillfish-governor-smu cyan-skillfish-governor"
+
+# Runs as root via pkexec. The GPU clock governor talks to the same SMU mailbox as the
+# unlock (message 0x98), so it is paused for the write and restarted afterwards.
+APPLY_SH = f"""
+tool="$1"; stopped=""
+for g in {GOVERNORS}; do
+  if systemctl is-active --quiet "$g"; then systemctl stop "$g" && stopped="$stopped $g"; fi
+done
+[ -n "$stopped" ] && echo "paused GPU governor:$stopped"
+"$tool" apply; rc=$?
+for g in $stopped; do systemctl start "$g"; done
+exit $rc
+"""
+WARM_REBOOT_SH = "echo warm > /sys/kernel/reboot/mode 2>/dev/null; systemctl reboot"
+
+UNLOCK_WARNING = (
+    "This uses the bc250-8core-unlock script to flip the SMU core-enable mask from "
+    "0x77 (6 cores) to 0xFF (8 cores).\n\n"
+    "• The two extra cores may have been disabled for a reason. Stress-test them "
+    "(stress-ng / mprime for a few hours) and watch dmesg for machine-check errors.\n"
+    "• The cores appear only after a WARM reboot. A cold boot (power removed) reverts to "
+    "6 cores, which is also the escape hatch if anything misbehaves.\n"
+    "• The script refuses boards whose mask isn't the stock 0x77. Nothing is written to flash.\n"
+    "• The extra cores share the SoC's power/thermal budget: re-check cooling and any "
+    "GPU/CPU overclock or undervolt.\n"
+    "• The new CPUs 12-15 get no idle C-states until you install the 8-core ACPI tables.\n\n"
+    "You use this at your own risk.")
+
+
+def cpu_lines(s: core.Snapshot) -> list[str]:
+    c = s.cpu
+    st = "UNLOCKED (8 cores)" if c.unlocked else ("stock (6 cores)" if c.cores == 6 else "?")
+    L = [f"CPU cores : {c.cores} cores / {c.threads} threads - {st}"
+         + (f"   Tctl {c.tctl_c:.0f} °C" if c.tctl_c is not None else "")]
+    if not c.unlocked:
+        L.append("            unlock tool: " + (c.unlock_tool or f"not installed ({UNLOCK_REPO})"))
+    if c.boot_unit:
+        L.append(f"            re-apply at boot: {'enabled' if c.boot_enabled else 'disabled'}")
+    return L
+
+
 # ---------------------------------------------------------------------- GUI
 def run_gui():
     import gi
     gi.require_version("Gtk", "4.0")
-    from gi.repository import Gtk, GLib, Pango
+    from gi.repository import Gtk, GLib, Pango, Gio
 
     CSS = b"""
     .title   { font-size: 18pt; font-weight: bold; }
@@ -231,6 +276,44 @@ def run_gui():
                 legend.append(b)
             card.append(legend)
             root.append(card)
+
+            # CPU cores / 8-core unlock
+            ccard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card"])
+            crow = Gtk.Box(spacing=12)
+            cl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            cl.append(Gtk.Label(label="CPU cores", xalign=0, css_classes=["sub"]))
+            self.cpu_val = Gtk.Label(xalign=0, css_classes=["big"])
+            cl.append(self.cpu_val)
+            self.cpu_det = Gtk.Label(xalign=0, css_classes=["sub"], wrap=True)
+            cl.append(self.cpu_det)
+            crow.append(cl)
+            bb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.CENTER)
+            self.unlock_btn = Gtk.Button(label="Unlock all 8 cores…",
+                                         css_classes=["destructive-action"])
+            self.unlock_btn.connect("clicked", self.on_unlock)
+            self.reboot_btn = Gtk.Button(label="Warm reboot now", css_classes=["suggested-action"],
+                                         visible=False)
+            self.reboot_btn.connect("clicked", self.on_reboot)
+            self.check_btn = Gtk.Button(label="Check mask")
+            self.check_btn.connect("clicked", self.on_check)
+            for b in (self.unlock_btn, self.reboot_btn, self.check_btn):
+                bb.append(b)
+            crow.append(bb)
+            ccard.append(crow)
+            brow = Gtk.Box(spacing=8)
+            brow.append(Gtk.Label(label="Re-apply unlock after every cold boot (systemd unit)",
+                                  xalign=0, hexpand=True, css_classes=["sub"]))
+            self.boot_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+            self.boot_sw_handler = self.boot_sw.connect("state-set", self.on_boot_toggle)
+            brow.append(self.boot_sw)
+            ccard.append(brow)
+            self.cpu_out = Gtk.Label(xalign=0, css_classes=["mono"], selectable=True, wrap=True,
+                                     visible=False)
+            ccard.append(self.cpu_out)
+            self.ccard = ccard
+            self.mask_set = False      # set after a successful apply this session
+            self.busy = False
+            root.append(ccard)
 
             # stat cards
             grid = Gtk.Grid(column_spacing=12, row_spacing=12, column_homogeneous=True)
@@ -354,6 +437,123 @@ def run_gui():
                 cr.set_line_width(2)
                 cr.stroke()
 
+        # -------------------------------------------------- 8-core unlock
+        def run_root(self, argv, done):
+            """Run argv through pkexec without blocking the UI; done(rc, output)."""
+            self.busy = True
+            self.update_cpu_buttons()
+            try:
+                proc = Gio.Subprocess.new(["pkexec"] + argv, Gio.SubprocessFlags.STDOUT_PIPE
+                                          | Gio.SubprocessFlags.STDERR_MERGE)
+            except GLib.Error as e:
+                self.busy = False
+                done(127, f"could not start pkexec: {e.message}")
+                return
+
+            def fin(p, res):
+                try:
+                    _ok, out, _err = p.communicate_utf8_finish(res)
+                except GLib.Error as e:
+                    out = e.message
+                rc = p.get_exit_status()
+                if rc in (126, 127) and not (out or "").strip():
+                    out = "authentication cancelled or not authorised"
+                self.busy = False
+                done(rc, (out or "").strip())
+                self.refresh()
+            proc.communicate_utf8_async(None, None, fin)
+
+        def show_out(self, text):
+            self.cpu_out.set_label(text)
+            self.cpu_out.set_visible(bool(text))
+
+        def ask(self, message, detail, buttons, cb, default=0):
+            dlg = Gtk.AlertDialog(message=message, detail=detail, buttons=buttons,
+                                  cancel_button=0, default_button=default, modal=True)
+
+            def done(d, res):
+                try:
+                    cb(d.choose_finish(res))
+                except GLib.Error:
+                    pass
+            dlg.choose(self, None, done)
+
+        def tool_missing(self):
+            self.ask("Unlock tool not installed",
+                     "The 8-core unlock uses GabriWar's MIT-licensed script. Read it, then "
+                     "install it:\n\n"
+                     f"git clone {UNLOCK_REPO}\n"
+                     "cd bc250-core-cu-unlock\n"
+                     "sudo pacman -S --needed pciutils\n"
+                     "sudo install -Dm755 bc250-8core-unlock.sh /usr/local/bin/bc250-8core-unlock\n\n"
+                     "Then press the button again.", ["Close"], lambda _i: None)
+
+        def on_unlock(self, _b):
+            tool = self.snap.cpu.unlock_tool
+            if not tool:
+                return self.tool_missing()
+
+            def go(i):
+                if i != 1:
+                    return
+
+                def done(rc, out):
+                    self.show_out(out)
+                    if rc == 0 and ("unlocked." in out or "already unlocked" in out):
+                        self.mask_set = True
+                        self.ask("Mask set to 0xFF",
+                                 "All 8 cores will appear after a warm reboot. "
+                                 "A cold boot reverts to 6.", ["Later", "Warm reboot now"],
+                                 lambda j: j == 1 and self.do_reboot(), default=1)
+                self.run_root(["sh", "-c", APPLY_SH, "sh", tool], done)
+            self.ask("Unlock all 8 CPU cores?", UNLOCK_WARNING, ["Cancel", "Unlock"], go)
+
+        def on_check(self, _b):
+            tool = self.snap.cpu.unlock_tool
+            if not tool:
+                return self.tool_missing()
+
+            def done(rc, out):
+                self.show_out(out)
+                if "state: UNLOCKED" in out and not self.snap.cpu.unlocked:
+                    self.mask_set = True
+            self.run_root([tool, "status"], done)
+
+        def on_reboot(self, _b):
+            self.ask("Warm reboot now?", "Save your work first. The system restarts with a warm "
+                     "reset so the 0xFF core mask survives.", ["Cancel", "Reboot"],
+                     lambda i: i == 1 and self.do_reboot())
+
+        def do_reboot(self):
+            self.run_root(["sh", "-c", WARM_REBOOT_SH], lambda rc, out: rc and self.show_out(out))
+
+        def on_boot_toggle(self, sw, state):
+            c = self.snap.cpu
+            if state == c.boot_enabled:
+                return False
+            if state and not c.unlock_tool:
+                self.tool_missing()
+                return True        # keep switch unchanged
+            if state:
+                # the script's own installer: copies itself to /usr/local/bin, writes + enables unit
+                argv = ([ "systemctl", "enable", core.UNLOCK_UNIT] if c.boot_unit
+                        else [c.unlock_tool, "install"])
+            else:
+                argv = ["systemctl", "disable", core.UNLOCK_UNIT]
+            self.run_root(argv, lambda rc, out: self.show_out(out))
+            return True            # refresh() sets the real state from disk
+
+        def update_cpu_buttons(self):
+            c = self.snap.cpu if self.snap else None
+            if not c:
+                return
+            self.unlock_btn.set_visible(not c.unlocked and not self.mask_set)
+            self.unlock_btn.set_sensitive(not self.busy and not self.mask_set)
+            self.reboot_btn.set_visible(self.mask_set and not c.unlocked)
+            self.reboot_btn.set_sensitive(not self.busy)
+            self.check_btn.set_sensitive(not self.busy)
+            self.boot_sw.set_sensitive(not self.busy)
+
         # -------------------------------------------------- refresh
         def refresh(self):
             want_procs = self.tick % 3 == 0 or self.snap is None
@@ -375,6 +575,24 @@ def run_gui():
             if g and g.temp_c is not None:
                 extra += f"  ·  {g.temp_c:.0f} °C"
             self.subtitle.set_label(f"UMA: {s.uma_mode}{extra}")
+
+            c = s.cpu
+            self.ccard.set_visible(bool(g and g.is_bc250))
+            self.cpu_val.set_label(f"{c.cores} cores / {c.threads} threads  ·  "
+                                   + ("unlocked" if c.unlocked else "stock" if c.cores == 6 else "?"))
+            det = [f"Tctl {c.tctl_c:.0f} °C"] if c.tctl_c is not None else []
+            if c.unlocked:
+                det.append("All 8 Zen 2 cores active (reverts on a cold boot unless the boot unit is on)")
+            elif self.mask_set:
+                det.append("Mask is 0xFF - warm reboot to bring up the two extra cores")
+            elif not c.unlock_tool:
+                det.append("Unlock tool not installed - the button explains how")
+            self.cpu_det.set_label("  ·  ".join(det))
+            self.boot_sw.handler_block(self.boot_sw_handler)
+            self.boot_sw.set_active(c.boot_enabled)
+            self.boot_sw.set_state(c.boot_enabled)
+            self.boot_sw.handler_unblock(self.boot_sw_handler)
+            self.update_cpu_buttons()
 
             vals = {k: v for k, v, _ in self.segments()}
             for k, (lbl, name) in self.legend_lbl.items():
