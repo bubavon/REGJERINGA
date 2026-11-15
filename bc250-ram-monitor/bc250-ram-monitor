@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""BC-250 RAM Monitor - shows how the AMD/ASRock BC-250's single 16 GB GDDR6
+pool is split between the CPU (system RAM) and the GPU (VRAM carve-out + GTT).
+
+GUI:  bc250-ram-monitor            (needs: sudo pacman -S python-gobject python-cairo gtk4)
+TUI:  bc250-ram-monitor --cli      (no extra packages)
+Once: bc250-ram-monitor --once     (print one report and exit)
+"""
+
+import os
+import sys
+import time
+from collections import deque
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, "/usr/share/bc250-ram-monitor")
+import bc250_core as core  # noqa: E402
+from bc250_core import fmt  # noqa: E402
+
+INTERVAL = 1.0
+HISTORY = 120
+
+# colours (r, g, b) shared by GUI segments and legend
+C_SYS_USED = (0.95, 0.45, 0.20)
+C_SYS_CACHE = (0.98, 0.75, 0.35)
+C_SYS_FREE = (0.30, 0.33, 0.38)
+C_VRAM_USED = (0.85, 0.15, 0.25)
+C_VRAM_FREE = (0.45, 0.18, 0.25)
+C_GTT = (0.70, 0.30, 0.85)
+C_RESV = (0.20, 0.20, 0.22)
+
+
+# --------------------------------------------------------------------- text
+def report(s: core.Snapshot, color: bool = True) -> str:
+    def bar(frac, width=40):
+        frac = min(max(frac, 0), 1)
+        n = int(round(frac * width))
+        return "█" * n + "░" * (width - n)
+
+    B = "\033[1m" if color else ""
+    R = "\033[0m" if color else ""
+    Y = "\033[33m" if color else ""
+    g = s.gpu
+    title = "ASRock / AMD BC-250" if (g and g.is_bc250) else "AMD APU (BC-250 not detected)"
+    L = [f"{B}{title}  -  shared 16 GB GDDR6 pool{R}", ""]
+    L.append(f"UMA mode : {s.uma_mode}")
+    L.append(f"Pool     : {fmt(s.pool_total)} = system {fmt(s.mem_total)}"
+             f" + VRAM carve-out {fmt(s.carveout)} + firmware {fmt(s.firmware_reserved)}")
+    L.append("")
+    if s.mem_total:
+        L.append(f"{B}System RAM{R}  {bar(s.used / s.mem_total)}  "
+                 f"{fmt(s.used)} / {fmt(s.mem_total)}  ({100 * s.used / s.mem_total:.0f}%)")
+        L.append(f"            cache {fmt(s.cache)}   available {fmt(s.mem_available)}")
+    if g:
+        if g.vram_total:
+            L.append(f"{B}GPU VRAM{R}    {bar(g.vram_used / g.vram_total)}  "
+                     f"{fmt(g.vram_used)} / {fmt(g.vram_total)}")
+        if g.gtt_total:
+            L.append(f"{B}GPU GTT{R}     {bar(g.gtt_used / g.gtt_total)}  "
+                     f"{fmt(g.gtt_used)} / {fmt(g.gtt_total)}  (borrowed system RAM)")
+        L.append(f"            GPU total in use: {fmt(s.gpu_total_used)}"
+                 + (f"   sclk {g.sclk_mhz} MHz" if g.sclk_mhz else "")
+                 + (f"   {g.temp_c:.0f} °C" if g.temp_c is not None else ""))
+    if s.swap_total:
+        L.append(f"{B}Swap{R}        {bar(s.swap_used / s.swap_total)}  "
+                 f"{fmt(s.swap_used)} / {fmt(s.swap_total)}")
+    for z in s.zram:
+        ratio = (z.orig / z.compr) if z.compr else 0
+        L.append(f"            {z.name}: {fmt(z.orig)} stored in {fmt(z.mem_used)} RAM"
+                 f" (ratio {ratio:.1f}x, size {fmt(z.disksize)})")
+    if s.procs:
+        L += ["", f"{B}{'PID':>7}  {'PROCESS':<22}{'RAM':>12}{'VRAM':>12}{'GTT':>12}{R}"]
+        for p in s.procs:
+            L.append(f"{p.pid:>7}  {p.name[:21]:<22}{fmt(p.rss):>12}"
+                     f"{fmt(p.vram) if p.vram else '-':>12}{fmt(p.gtt) if p.gtt else '-':>12}")
+    if s.warnings:
+        L.append("")
+        for w in s.warnings:
+            L.append(f"{Y}⚠ {w}{R}")
+    return "\n".join(L)
+
+
+def run_cli():
+    try:
+        while True:
+            s = core.snapshot()
+            sys.stdout.write("\033[H\033[2J" + report(s) + "\n\n(Ctrl+C to quit)\n")
+            sys.stdout.flush()
+            time.sleep(INTERVAL)
+    except KeyboardInterrupt:
+        print()
+
+
+# ---------------------------------------------------------------------- GUI
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk, GLib, Pango
+
+    CSS = b"""
+    .title   { font-size: 18pt; font-weight: bold; }
+    .sub     { opacity: 0.7; }
+    .big     { font-size: 14pt; font-weight: bold; font-feature-settings: "tnum"; }
+    .card    { padding: 12px; border-radius: 10px;
+               background: alpha(currentColor, 0.06); }
+    .warn    { color: #e5a50a; font-weight: bold; }
+    .mono    { font-family: monospace; }
+    """
+
+    def swatch(rgb):
+        a = Gtk.DrawingArea()
+        a.set_content_width(12)
+        a.set_content_height(12)
+        a.set_valign(Gtk.Align.CENTER)
+
+        def draw(_a, cr, w, h):
+            cr.set_source_rgb(*rgb)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+        a.set_draw_func(draw)
+        return a
+
+    class Win(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="BC-250 RAM Monitor")
+            self.set_default_size(820, 760)
+            self.snap = None
+            self.hist_sys = deque([0.0] * HISTORY, maxlen=HISTORY)
+            self.hist_gpu = deque([0.0] * HISTORY, maxlen=HISTORY)
+            self.tick = 0
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            for m in ("top", "bottom", "start", "end"):
+                getattr(root, f"set_margin_{m}")(16)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_child(root)
+            self.set_child(scroll)
+
+            self.title = Gtk.Label(xalign=0, css_classes=["title"])
+            self.subtitle = Gtk.Label(xalign=0, css_classes=["sub"], wrap=True)
+            root.append(self.title)
+            root.append(self.subtitle)
+
+            # pool bar
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card"])
+            card.append(Gtk.Label(label="Shared 16 GB GDDR6 pool", xalign=0, css_classes=["big"]))
+            self.pool = Gtk.DrawingArea(content_height=46, hexpand=True)
+            self.pool.set_draw_func(self.draw_pool)
+            card.append(self.pool)
+            legend = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4)
+            self.legend_lbl = {}
+            for key, rgb, name in (("sys_used", C_SYS_USED, "CPU used"),
+                                   ("sys_cache", C_SYS_CACHE, "CPU cache"),
+                                   ("sys_free", C_SYS_FREE, "CPU free"),
+                                   ("gtt", C_GTT, "GPU GTT (in CPU RAM)"),
+                                   ("vram_used", C_VRAM_USED, "VRAM used"),
+                                   ("vram_free", C_VRAM_FREE, "VRAM free"),
+                                   ("resv", C_RESV, "Firmware")):
+                b = Gtk.Box(spacing=6)
+                b.append(swatch(rgb))
+                lbl = Gtk.Label(label=name, xalign=0)
+                self.legend_lbl[key] = (lbl, name)
+                b.append(lbl)
+                legend.append(b)
+            card.append(legend)
+            root.append(card)
+
+            # stat cards
+            grid = Gtk.Grid(column_spacing=12, row_spacing=12, column_homogeneous=True)
+            self.stats = {}
+            for i, (key, name) in enumerate((("sys", "System RAM"), ("vram", "GPU VRAM"),
+                                             ("gtt", "GPU GTT"), ("swap", "Swap / ZRAM"))):
+                c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["card"])
+                c.append(Gtk.Label(label=name, xalign=0, css_classes=["sub"]))
+                val = Gtk.Label(xalign=0, css_classes=["big"])
+                bar = Gtk.LevelBar(min_value=0, max_value=1)
+                det = Gtk.Label(xalign=0, css_classes=["sub"], wrap=True)
+                c.append(val)
+                c.append(bar)
+                c.append(det)
+                grid.attach(c, i % 2, i // 2, 1, 1)
+                self.stats[key] = (val, bar, det)
+            root.append(grid)
+
+            # history
+            hcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+            hb = Gtk.Box(spacing=12)
+            hb.append(Gtk.Label(label=f"History ({HISTORY}s)", xalign=0, css_classes=["big"], hexpand=True))
+            for rgb, n in ((C_SYS_USED, "System RAM %"), (C_GTT, "GPU total % of pool")):
+                hb.append(swatch(rgb))
+                hb.append(Gtk.Label(label=n))
+            hcard.append(hb)
+            self.graph = Gtk.DrawingArea(content_height=140, hexpand=True)
+            self.graph.set_draw_func(self.draw_graph)
+            hcard.append(self.graph)
+            root.append(hcard)
+
+            # warnings
+            self.warn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            root.append(self.warn_box)
+
+            # processes
+            pcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+            pcard.append(Gtk.Label(label="Top memory users (RAM + VRAM + GTT)", xalign=0, css_classes=["big"]))
+            self.proc_lbl = Gtk.Label(xalign=0, css_classes=["mono"], selectable=True)
+            self.proc_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            pcard.append(self.proc_lbl)
+            root.append(pcard)
+
+            self.refresh()
+            GLib.timeout_add(int(INTERVAL * 1000), self.refresh)
+
+        # -------------------------------------------------- drawing
+        def segments(self):
+            s = self.snap
+            g = s.gpu
+            gtt = min(g.gtt_used if g else 0, s.used)
+            cpu_used = max(0, s.used - gtt)
+            cache = min(s.cache, max(0, s.mem_total - s.used))
+            free = max(0, s.mem_total - s.used - cache)
+            vu = g.vram_used if g else 0
+            vf = max(0, (g.vram_total if g else 0) - vu)
+            return [("sys_used", cpu_used, C_SYS_USED), ("gtt", gtt, C_GTT),
+                    ("sys_cache", cache, C_SYS_CACHE), ("sys_free", free, C_SYS_FREE),
+                    ("resv", s.firmware_reserved, C_RESV),
+                    ("vram_used", vu, C_VRAM_USED), ("vram_free", vf, C_VRAM_FREE)]
+
+        def draw_pool(self, _a, cr, w, h):
+            if not self.snap:
+                return
+            total = sum(v for _, v, _ in self.segments()) or 1
+            x = 0.0
+            for _k, v, rgb in self.segments():
+                sw = w * v / total
+                cr.set_source_rgb(*rgb)
+                cr.rectangle(x, 0, sw, h)
+                cr.fill()
+                x += sw
+            # divider between system RAM and VRAM carve-out
+            s = self.snap
+            dx = w * (s.mem_total + s.firmware_reserved) / total
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(2)
+            cr.move_to(dx, 0)
+            cr.line_to(dx, h)
+            cr.stroke()
+
+        def draw_graph(self, _a, cr, w, h):
+            cr.set_source_rgba(0.5, 0.5, 0.5, 0.25)
+            cr.set_line_width(1)
+            for f in (0.25, 0.5, 0.75):
+                cr.move_to(0, h * f)
+                cr.line_to(w, h * f)
+            cr.stroke()
+            for data, rgb in ((self.hist_sys, C_SYS_USED), (self.hist_gpu, C_GTT)):
+                step = w / (len(data) - 1)
+                cr.move_to(0, h)
+                for i, v in enumerate(data):
+                    cr.line_to(i * step, h - v * h)
+                cr.line_to(w, h)
+                cr.close_path()
+                cr.set_source_rgba(*rgb, 0.18)
+                cr.fill_preserve()
+                cr.new_path()
+                for i, v in enumerate(data):
+                    (cr.move_to if i == 0 else cr.line_to)(i * step, h - v * h)
+                cr.set_source_rgb(*rgb)
+                cr.set_line_width(2)
+                cr.stroke()
+
+        # -------------------------------------------------- refresh
+        def refresh(self):
+            want_procs = self.tick % 3 == 0 or self.snap is None
+            s = core.snapshot(procs=want_procs)
+            if not want_procs and self.snap:
+                s.procs = self.snap.procs
+            self.tick += 1
+            self.snap = s
+            g = s.gpu
+
+            if g and g.is_bc250:
+                self.title.set_label("ASRock / AMD BC-250")
+            else:
+                self.title.set_label("BC-250 RAM Monitor (BC-250 GPU not detected)")
+            extra = f"  ·  GPU {g.card} {g.device_id}" if g else ""
+            if g and g.sclk_mhz:
+                extra += f"  ·  {g.sclk_mhz} MHz"
+            if g and g.temp_c is not None:
+                extra += f"  ·  {g.temp_c:.0f} °C"
+            self.subtitle.set_label(f"UMA: {s.uma_mode}{extra}")
+
+            vals = {k: v for k, v, _ in self.segments()}
+            for k, (lbl, name) in self.legend_lbl.items():
+                lbl.set_label(f"{name}  {fmt(vals.get(k, 0))}")
+
+            def setc(key, used, total, detail):
+                val, bar, det = self.stats[key]
+                if total:
+                    val.set_label(f"{fmt(used)} / {fmt(total)}")
+                    bar.set_value(min(1, used / total))
+                else:
+                    val.set_label("n/a")
+                    bar.set_value(0)
+                det.set_label(detail)
+
+            setc("sys", s.used, s.mem_total,
+                 f"{100 * s.used / max(1, s.mem_total):.0f}% used · cache {fmt(s.cache)} · "
+                 f"available {fmt(s.mem_available)}")
+            if g:
+                setc("vram", g.vram_used, g.vram_total,
+                     "BIOS carve-out (UMA frame buffer)"
+                     + (f" · CPU-visible {fmt(g.vis_vram_used)}/{fmt(g.vis_vram_total)}"
+                        if g.vis_vram_total and g.vis_vram_total != g.vram_total else ""))
+                setc("gtt", g.gtt_used, g.gtt_total,
+                     f"System RAM borrowed by the GPU · GPU total {fmt(s.gpu_total_used)}")
+            else:
+                setc("vram", 0, 0, "amdgpu not found")
+                setc("gtt", 0, 0, "")
+            zd = " · ".join(f"{z.name}: {fmt(z.orig)}→{fmt(z.mem_used)}" for z in s.zram)
+            setc("swap", s.swap_used, s.swap_total, zd or "no zram devices")
+
+            pool = max(1, s.pool_total)
+            self.hist_sys.append(s.used / max(1, s.mem_total))
+            self.hist_gpu.append(min(1, s.gpu_total_used / pool))
+
+            child = self.warn_box.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                self.warn_box.remove(child)
+                child = nxt
+            for wtxt in s.warnings:
+                self.warn_box.append(Gtk.Label(label="⚠ " + wtxt, xalign=0, wrap=True,
+                                               css_classes=["warn"]))
+
+            rows = [f"{'PID':>7}  {'PROCESS':<20}{'RAM':>11}{'VRAM':>11}{'GTT':>11}"]
+            for p in s.procs:
+                rows.append(f"{p.pid:>7}  {p.name[:19]:<20}{fmt(p.rss):>11}"
+                            f"{fmt(p.vram) if p.vram else '-':>11}{fmt(p.gtt) if p.gtt else '-':>11}")
+            self.proc_lbl.set_label("\n".join(rows))
+
+            self.pool.queue_draw()
+            self.graph.queue_draw()
+            return True
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.bc250.RamMonitor")
+
+        def do_activate(self):
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            from gi.repository import Gdk
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            (self.props.active_window or Win(self)).present()
+
+    return App().run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        return 0
+    if "--once" in args:
+        print(report(core.snapshot(), color=sys.stdout.isatty()))
+        return 0
+    if "--cli" in args:
+        run_cli()
+        return 0
+    try:
+        return run_gui()
+    except (ImportError, ValueError, TypeError) as e:
+        print(f"GTK4 GUI unavailable ({e}).\n"
+              "Install it with:  sudo pacman -S python-gobject python-cairo gtk4\n"
+              "Falling back to terminal mode...\n", file=sys.stderr)
+        time.sleep(2)
+        run_cli()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

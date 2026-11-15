@@ -1,0 +1,18 @@
+# Build & install system-wide on CachyOS/Arch:  makepkg -si
+pkgname=bc250-ram-monitor
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="RAM / VRAM / GTT monitor for the ASRock/AMD BC-250 shared 16GB GDDR6 pool"
+arch=('any')
+license=('MIT')
+depends=('python' 'python-gobject' 'python-cairo' 'gtk4')
+source=('bc250-ram-monitor' 'bc250_core.py' 'bc250-ram-monitor.desktop')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm644 bc250_core.py "$pkgdir/usr/share/bc250-ram-monitor/bc250_core.py"
+    install -Dm755 bc250-ram-monitor "$pkgdir/usr/share/bc250-ram-monitor/bc250-ram-monitor"
+    install -d "$pkgdir/usr/bin"
+    ln -s /usr/share/bc250-ram-monitor/bc250-ram-monitor "$pkgdir/usr/bin/bc250-ram-monitor"
+    install -Dm644 bc250-ram-monitor.desktop "$pkgdir/usr/share/applications/bc250-ram-monitor.desktop"
+}

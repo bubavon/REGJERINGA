@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BC-250 RAM Monitor
+Comment=Shared 16 GB GDDR6 usage (system RAM, VRAM, GTT) for the ASRock/AMD BC-250
+Exec=bc250-ram-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=ram;memory;vram;gtt;bc250;amd;
