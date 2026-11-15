@@ -32,6 +32,11 @@ C_RESV = (0.20, 0.20, 0.22)
 
 
 # --------------------------------------------------------------------- text
+def gm(p: core.Proc, n: int) -> str:
+    """GPU memory cell for a process table."""
+    return "n/a" if not p.gpu_known else (fmt(n) if n else "-")
+
+
 def llm_lines(s: core.Snapshot, B: str = "", R: str = "") -> list[str]:
     g, t = s.gpu, s.ttm
     L = [f"{B}LLM / inference{R}"]
@@ -48,8 +53,12 @@ def llm_lines(s: core.Snapshot, B: str = "", R: str = "") -> list[str]:
     if s.llm_procs:
         for p in s.llm_procs:
             adj = core.read_oom_adj(p.pid)
-            L.append(f"  {p.name[:18]:<18} pid {p.pid:<7} RAM {fmt(p.rss):>11}  VRAM {fmt(p.vram):>11}"
-                     f"  GTT {fmt(p.gtt):>11}  oom_adj {adj if adj is not None else '?'}")
+            vram, gtt = (fmt(p.vram), fmt(p.gtt)) if p.gpu_known else ("n/a", "n/a")
+            L.append(f"  {p.name[:18]:<18} pid {p.pid:<7} RAM {fmt(p.rss):>11}  VRAM {vram:>11}"
+                     f"  GTT {gtt:>11}  oom_adj {adj if adj is not None else '?'}")
+        if any(not p.gpu_known for p in s.llm_procs):
+            L.append("  n/a = process belongs to another user (e.g. the ollama service); "
+                     "run this monitor with sudo to see its GPU memory")
     else:
         L.append("  No LLM runtime running (ollama, llama-server, koboldcpp, ...)")
     if s.ollama:
@@ -108,7 +117,7 @@ def report(s: core.Snapshot, color: bool = True) -> str:
         L += ["", f"{B}{'PID':>7}  {'PROCESS':<22}{'RAM':>12}{'VRAM':>12}{'GTT':>12}{R}"]
         for p in s.procs:
             L.append(f"{p.pid:>7}  {p.name[:21]:<22}{fmt(p.rss):>12}"
-                     f"{fmt(p.vram) if p.vram else '-':>12}{fmt(p.gtt) if p.gtt else '-':>12}")
+                     f"{gm(p, p.vram):>12}{gm(p, p.gtt):>12}")
     if s.warnings:
         L.append("")
         for w in s.warnings:
@@ -192,9 +201,11 @@ UNLOCK_WARNING = (
 
 def cpu_lines(s: core.Snapshot) -> list[str]:
     c = s.cpu
+    temp = f"   Tctl {c.tctl_c:.0f} °C" if c.tctl_c is not None else ""
+    if not (s.gpu and s.gpu.is_bc250):       # unlock only applies to a BC-250
+        return [f"CPU cores : {c.cores} cores / {c.threads} threads{temp}"]
     st = "UNLOCKED (8 cores)" if c.unlocked else ("stock (6 cores)" if c.cores == 6 else "?")
-    L = [f"CPU cores : {c.cores} cores / {c.threads} threads - {st}"
-         + (f"   Tctl {c.tctl_c:.0f} °C" if c.tctl_c is not None else "")]
+    L = [f"CPU cores : {c.cores} cores / {c.threads} threads - {st}{temp}"]
     if not c.unlocked:
         L.append("            unlock tool: " + (c.unlock_tool or f"not installed ({UNLOCK_REPO})"))
     if c.boot_unit:
@@ -206,6 +217,7 @@ def cpu_lines(s: core.Snapshot) -> list[str]:
 def run_gui():
     import gi
     gi.require_version("Gtk", "4.0")
+    gi.require_foreign("cairo")      # raises ImportError if python-cairo is missing
     from gi.repository import Gtk, GLib, Pango, Gio
 
     CSS = b"""
@@ -652,7 +664,7 @@ def run_gui():
             rows = [f"{'PID':>7}  {'PROCESS':<20}{'RAM':>11}{'VRAM':>11}{'GTT':>11}"]
             for p in s.procs:
                 rows.append(f"{p.pid:>7}  {p.name[:19]:<20}{fmt(p.rss):>11}"
-                            f"{fmt(p.vram) if p.vram else '-':>11}{fmt(p.gtt) if p.gtt else '-':>11}")
+                            f"{gm(p, p.vram):>11}{gm(p, p.gtt):>11}")
             self.proc_lbl.set_label("\n".join(rows))
 
             self.pool.queue_draw()

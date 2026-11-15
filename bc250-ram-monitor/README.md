@@ -128,6 +128,10 @@ bc250-ram-monitor --log run.csv   # CSV log every second (LLM benchmarks)
 
 No root needed. Everything is read from procfs/sysfs.
 
+One limit: Linux only lets you read GPU memory for your own processes. If Ollama runs as
+a system service (user `ollama`), its VRAM/GTT columns show `n/a`. Run
+`sudo bc250-ram-monitor --cli` to see them. The pool totals are unaffected.
+
 ## Testing without a BC-250
 
 ```sh

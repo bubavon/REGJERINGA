@@ -81,6 +81,7 @@ class Proc:
     rss: int
     vram: int = 0
     gtt: int = 0
+    gpu_known: bool = True   # False: fdinfo unreadable (process of another user)
 
 
 @dataclass
@@ -289,6 +290,11 @@ def read_procs(limit: int = 10, gpu: bool = True) -> list[Proc]:
         # amdgpu exposes per-client memory in fdinfo (kernel 5.17+/6.x)
         for pid, p in procs.items():
             clients: dict[str, dict[str, int]] = {}
+            try:
+                os.listdir(_p(f"/proc/{pid}/fdinfo"))
+            except OSError:
+                p.gpu_known = False
+                continue
             for fi in glob.glob(_p(f"/proc/{pid}/fdinfo/*")):
                 txt = _read(fi[len(ROOT):])
                 if not re.search(r"drm-driver:\s*amdgpu", txt):
@@ -386,8 +392,10 @@ def read_vmstat() -> dict[str, int]:
 
 
 def is_llm(name: str) -> bool:
+    """Exact match for short names; prefix match only for unambiguous ones
+    (a bare prefix test made "sd" match sddm, the CachyOS login manager)."""
     n = name.lower()
-    return any(n == x or n.startswith(x) for x in LLM_NAMES)
+    return n in LLM_NAMES or n.startswith(("ollama", "llama-", "koboldcpp", "whisper-"))
 
 
 def read_oom_adj(pid: int) -> int | None:
@@ -492,6 +500,8 @@ def build_warnings(s: Snapshot) -> list[str]:
     if g.vram_total > 600 * MiB and g.vram_used / g.vram_total > 0.95:
         w.append("Fixed VRAM carve-out is full; the GPU is spilling into GTT.")
     c = s.cpu
+    if not g.is_bc250:
+        c = CpuCores()
     if c.no_cstate_cpus:
         w.append(f"CPUs {', '.join(map(str, c.no_cstate_cpus))} have no idle C-states: the stock "
                  "6-core ACPI tables don't cover the unlocked cores, so they never sleep (more heat "
