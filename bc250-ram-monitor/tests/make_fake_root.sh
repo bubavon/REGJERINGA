@@ -27,3 +27,16 @@ echo "BOOT_IMAGE=/vmlinuz-linux-cachyos root=UUID=x rw quiet" > $R/proc/cmdline
 printf 'Name:\tCyberpunk2077.exe\nVmRSS:\t 6291456 kB\n' > $R/proc/4242/status
 printf 'pos:\t0\ndrm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-memory-vram:\t327680 KiB\ndrm-memory-gtt:\t4000000 KiB\n' > $R/proc/4242/fdinfo/12
 printf 'pos:\t0\ndrm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-memory-vram:\t327680 KiB\n' > $R/proc/4242/fdinfo/13
+# --- LLM scenario: ollama running, TTM silently capped at 12 GiB by tmpfiles.d
+mkdir -p $R/sys/module/ttm/parameters $R/etc/modprobe.d $R/etc/tmpfiles.d $R/proc/777/fdinfo
+echo 3145728 > $R/sys/module/ttm/parameters/pages_limit
+echo 3145728 > $R/sys/module/ttm/parameters/page_pool_size
+echo "options ttm pages_limit=4194304 page_pool_size=4194304" > $R/etc/modprobe.d/ttm-gpu-memory.conf
+echo "w /sys/module/ttm/parameters/pages_limit - - - - 3145728" > $R/etc/tmpfiles.d/gpu-ttm-memory.conf
+echo 52000000 > $D/hwmon/hwmon3/power1_average
+echo "BOOT_IMAGE=/vmlinuz-linux-cachyos root=UUID=x rw quiet amdgpu.gttsize=14336" > $R/proc/cmdline
+printf 'Name:\tollama\nVmRSS:\t 1048576 kB\n' > $R/proc/777/status
+echo 200 > $R/proc/777/oom_score_adj
+printf 'drm-driver:\tamdgpu\ndrm-client-id:\t9\ndrm-memory-vram:\t300000 KiB\ndrm-memory-gtt:\t9000000 KiB\n' > $R/proc/777/fdinfo/20
+printf 'pswpin 10\npswpout 20\npgmajfault 30\n' > $R/proc/vmstat
+echo '{"models":[{"name":"qwen3:14b","size":9900000000,"size_vram":9000000000,"context_length":32768}]}' > $R/ollama_ps.json

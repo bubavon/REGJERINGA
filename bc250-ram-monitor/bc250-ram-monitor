@@ -5,6 +5,7 @@ pool is split between the CPU (system RAM) and the GPU (VRAM carve-out + GTT).
 GUI:  bc250-ram-monitor            (needs: sudo pacman -S python-gobject python-cairo gtk4)
 TUI:  bc250-ram-monitor --cli      (no extra packages)
 Once: bc250-ram-monitor --once     (print one report and exit)
+Log:  bc250-ram-monitor --log FILE (append a CSV row every second, e.g. during LLM runs)
 """
 
 import os
@@ -31,6 +32,39 @@ C_RESV = (0.20, 0.20, 0.22)
 
 
 # --------------------------------------------------------------------- text
+def llm_lines(s: core.Snapshot, B: str = "", R: str = "") -> list[str]:
+    g, t = s.gpu, s.ttm
+    L = [f"{B}LLM / inference{R}"]
+    if g:
+        lim = f"TTM pages_limit {t.pages_limit} = {fmt(t.limit_bytes)}" if t.pages_limit \
+            else "TTM pages_limit unknown"
+        L.append(f"  GPU memory ceiling : {fmt(s.gpu_ceiling)}  (VRAM {fmt(g.vram_total)} + GTT "
+                 f"{fmt(g.gtt_total)}, {lim})")
+        L.append(f"  Headroom for model : {fmt(s.llm_headroom)} more weights / KV cache can load")
+        if g.power_w is not None:
+            L.append(f"  GPU power          : {g.power_w:.0f} W (SMU reading, uncalibrated)")
+    L.append(f"  Paging             : swap-in {s.swap_in_rate:.0f}/s  swap-out {s.swap_out_rate:.0f}/s"
+             f"  major faults {s.majflt_rate:.0f}/s  (should stay ~0 during inference)")
+    if s.llm_procs:
+        for p in s.llm_procs:
+            adj = core.read_oom_adj(p.pid)
+            L.append(f"  {p.name[:18]:<18} pid {p.pid:<7} RAM {fmt(p.rss):>11}  VRAM {fmt(p.vram):>11}"
+                     f"  GTT {fmt(p.gtt):>11}  oom_adj {adj if adj is not None else '?'}")
+    else:
+        L.append("  No LLM runtime running (ollama, llama-server, koboldcpp, ...)")
+    if s.ollama:
+        for m in s.ollama:
+            gpu_pct = 100 * m.size_vram / m.size if m.size else 0
+            tps = core.BC250_BANDWIDTH / m.size if m.size else 0
+            L.append(f"  ollama: {m.name:<24} {fmt(m.size):>11}  {gpu_pct:3.0f}% GPU"
+                     + (f"  ctx {m.context}" if m.context else "")
+                     + f"  ≈{tps:.0f} tok/s max*")
+        L.append("  * dense-model ceiling = 357 GB/s ÷ model size; MoE models can go faster")
+    elif s.ollama is not None:
+        L.append("  ollama: no model loaded")
+    return L
+
+
 def report(s: core.Snapshot, color: bool = True) -> str:
     def bar(frac, width=40):
         frac = min(max(frac, 0), 1)
@@ -68,6 +102,7 @@ def report(s: core.Snapshot, color: bool = True) -> str:
         ratio = (z.orig / z.compr) if z.compr else 0
         L.append(f"            {z.name}: {fmt(z.orig)} stored in {fmt(z.mem_used)} RAM"
                  f" (ratio {ratio:.1f}x, size {fmt(z.disksize)})")
+    L += [""] + llm_lines(s, B, R)
     if s.procs:
         L += ["", f"{B}{'PID':>7}  {'PROCESS':<22}{'RAM':>12}{'VRAM':>12}{'GTT':>12}{R}"]
         for p in s.procs:
@@ -81,14 +116,45 @@ def report(s: core.Snapshot, color: bool = True) -> str:
 
 
 def run_cli():
+    rates = core.RateTracker()
     try:
         while True:
-            s = core.snapshot()
+            s = core.snapshot(rates=rates)
             sys.stdout.write("\033[H\033[2J" + report(s) + "\n\n(Ctrl+C to quit)\n")
             sys.stdout.flush()
             time.sleep(INTERVAL)
     except KeyboardInterrupt:
         print()
+
+
+def run_log(path: str):
+    """Append one CSV row per second - handy for long LLM runs / benchmarks."""
+    import csv
+    import datetime
+    cols = ["time", "sys_used", "sys_available", "vram_used", "gtt_used", "gpu_ceiling",
+            "llm_headroom", "swap_used", "swap_out_per_s", "majflt_per_s", "sclk_mhz",
+            "temp_c", "power_w", "llm_procs_rss", "ollama_models"]
+    new = not os.path.exists(path)
+    rates = core.RateTracker()
+    print(f"Logging to {path} every {INTERVAL:.0f}s (Ctrl+C to stop)")
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(cols)
+        try:
+            while True:
+                s = core.snapshot(rates=rates)
+                g = s.gpu or core.Gpu()
+                w.writerow([datetime.datetime.now().isoformat(timespec="seconds"),
+                            s.used, s.mem_available, g.vram_used, g.gtt_used, s.gpu_ceiling,
+                            s.llm_headroom, s.swap_used, round(s.swap_out_rate),
+                            round(s.majflt_rate), g.sclk_mhz, g.temp_c, g.power_w,
+                            sum(p.rss for p in s.llm_procs),
+                            ";".join(m.name for m in s.ollama or [])])
+                f.flush()
+                time.sleep(INTERVAL)
+        except KeyboardInterrupt:
+            print()
 
 
 # ---------------------------------------------------------------------- GUI
@@ -123,11 +189,12 @@ def run_gui():
     class Win(Gtk.ApplicationWindow):
         def __init__(self, app):
             super().__init__(application=app, title="BC-250 RAM Monitor")
-            self.set_default_size(820, 760)
+            self.set_default_size(860, 820)
             self.snap = None
             self.hist_sys = deque([0.0] * HISTORY, maxlen=HISTORY)
             self.hist_gpu = deque([0.0] * HISTORY, maxlen=HISTORY)
             self.tick = 0
+            self.rates = core.RateTracker()
 
             root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             for m in ("top", "bottom", "start", "end"):
@@ -194,6 +261,25 @@ def run_gui():
             self.graph.set_draw_func(self.draw_graph)
             hcard.append(self.graph)
             root.append(hcard)
+
+            # LLM
+            lcard = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+            lcard.append(Gtk.Label(label="LLM / inference", xalign=0, css_classes=["big"]))
+            lrow = Gtk.Box(spacing=24)
+            self.llm_head = Gtk.Label(xalign=0, css_classes=["big"])
+            self.llm_ceiling = Gtk.Label(xalign=0, css_classes=["sub"], wrap=True)
+            hbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            hbox.append(Gtk.Label(label="Headroom for model weights / KV cache", xalign=0,
+                                  css_classes=["sub"]))
+            hbox.append(self.llm_head)
+            lrow.append(hbox)
+            lrow.append(self.llm_ceiling)
+            lcard.append(lrow)
+            self.llm_bar = Gtk.LevelBar(min_value=0, max_value=1)
+            lcard.append(self.llm_bar)
+            self.llm_lbl = Gtk.Label(xalign=0, css_classes=["mono"], selectable=True, wrap=True)
+            lcard.append(self.llm_lbl)
+            root.append(lcard)
 
             # warnings
             self.warn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -271,9 +357,10 @@ def run_gui():
         # -------------------------------------------------- refresh
         def refresh(self):
             want_procs = self.tick % 3 == 0 or self.snap is None
-            s = core.snapshot(procs=want_procs)
+            s = core.snapshot(procs=want_procs, rates=self.rates)
             if not want_procs and self.snap:
-                s.procs = self.snap.procs
+                s.procs, s.llm_procs, s.ollama = self.snap.procs, self.snap.llm_procs, self.snap.ollama
+                s.warnings = core.build_warnings(s)
             self.tick += 1
             self.snap = s
             g = s.gpu
@@ -318,6 +405,18 @@ def run_gui():
                 setc("gtt", 0, 0, "")
             zd = " · ".join(f"{z.name}: {fmt(z.orig)}→{fmt(z.mem_used)}" for z in s.zram)
             setc("swap", s.swap_used, s.swap_total, zd or "no zram devices")
+
+            if g:
+                ceil = max(1, s.gpu_ceiling)
+                self.llm_head.set_label(fmt(s.llm_headroom))
+                lim = f"TTM limit {fmt(s.ttm.limit_bytes)}" if s.ttm.pages_limit else "TTM limit unknown"
+                self.llm_ceiling.set_label(
+                    f"GPU ceiling {fmt(s.gpu_ceiling)}\nVRAM {fmt(g.vram_total)} + GTT "
+                    f"{fmt(g.gtt_total)} · {lim}"
+                    + (f"\nGPU power {g.power_w:.0f} W (uncalibrated)" if g.power_w is not None else ""))
+                self.llm_bar.set_value(min(1, s.gpu_total_used / ceil))
+            skip = ("LLM", "  GPU memory ceiling", "  Headroom", "  GPU power")
+            self.llm_lbl.set_label("\n".join(x.strip() for x in llm_lines(s) if not x.startswith(skip)))
 
             pool = max(1, s.pool_total)
             self.hist_sys.append(s.used / max(1, s.mem_total))
@@ -364,6 +463,10 @@ def main():
         return 0
     if "--once" in args:
         print(report(core.snapshot(), color=sys.stdout.isatty()))
+        return 0
+    if "--log" in args:
+        i = args.index("--log")
+        run_log(args[i + 1] if i + 1 < len(args) else "bc250-ram-log.csv")
         return 0
     if "--cli" in args:
         run_cli()
